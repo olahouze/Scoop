@@ -3,6 +3,9 @@ BeforeAll {
     . "$PSScriptRoot\..\lib\core.ps1"
     . "$PSScriptRoot\..\lib\system.ps1"
     . "$PSScriptRoot\..\lib\manifest.ps1"
+    . "$PSScriptRoot\..\lib\versions.ps1"
+    . "$PSScriptRoot\..\lib\download.ps1"
+    . "$PSScriptRoot\..\lib\decompress.ps1"
     . "$PSScriptRoot\..\lib\shortcuts.ps1"
     . "$PSScriptRoot\..\lib\psmodules.ps1"
     . "$PSScriptRoot\..\lib\shim.ps1"
@@ -50,6 +53,128 @@ Describe 'install_app' -Tag 'Scoop' {
 
         $deps | Should-BeCollection -Count 1
         @($deps)[0] | Should-Be 'bar'
+    }
+
+    It 'should stage download and remove staging and empty appdir on download failure' {
+        $appRoot = Join-Path $TestDrive 'atomic_dl_fail\apps\foo'
+        $persistRoot = Join-Path $TestDrive 'atomic_dl_fail\persist\foo'
+        Mock Get-Manifest { 'foo', [PSCustomObject]@{ version = '1.0' }, 'main', $null }
+        Mock Get-SupportedArchitecture { '64bit' }
+        Mock appdir { $appRoot }
+        Mock versiondir { Join-Path $appRoot $version }
+        Mock persistdir { $persistRoot }
+        Mock Invoke-ScoopDownload { $null }
+
+        $failed = @{}
+        install_app 'foo' '64bit' $false @{} $failed
+
+        $failed['foo'] | Should-Be 'download failed'
+        (Test-Path (Join-Path $appRoot '_scoop_staging_1.0')) | Should-BeFalse
+        (Test-Path (Join-Path $appRoot '1.0')) | Should-BeFalse
+        (Test-Path $appRoot) | Should-BeFalse
+    }
+
+    It 'should not unlink previous version when pre_install fails before link_current' {
+        $appRoot = Join-Path $TestDrive 'atomic_preinstall_fail\apps\foo'
+        $persistRoot = Join-Path $TestDrive 'atomic_preinstall_fail\persist\foo'
+        $v1Dir = Join-Path $appRoot '1.0'
+        New-Item -ItemType Directory -Path $v1Dir -Force | Out-Null
+        Set-Content -Path (Join-Path $v1Dir 'foo.exe') -Value 'v1'
+
+        Mock Get-Manifest { 'foo', [PSCustomObject]@{ version = '2.0'; pre_install = 'throw "pre_install error"' }, 'main', $null }
+        Mock Get-SupportedArchitecture { '64bit' }
+        Mock appdir { $appRoot }
+        Mock versiondir { Join-Path $appRoot $version }
+        Mock persistdir { $persistRoot }
+        Mock Invoke-ScoopDownload { 'foo.zip' }
+        Mock Invoke-Extraction { Set-Content -Path (Join-Path $Path 'foo.exe') -Value 'v2' }
+        Mock unlink_app {}
+        Mock error {}
+
+        $failed = @{}
+        install_app 'foo' '64bit' $false @{} $failed
+
+        $failed['foo'] | Should-Be 'pre_install error'
+        Should-Invoke unlink_app -Times 0
+        (Test-Path $v1Dir) | Should-BeTrue
+        (Test-Path (Join-Path $appRoot '2.0')) | Should-BeFalse
+        (Test-Path (Join-Path $appRoot '_scoop_staging_2.0')) | Should-BeFalse
+    }
+
+    It 'should unlink persisted junctions before removing failed target directory on post_install failure' {
+        $appRoot = Join-Path $TestDrive 'atomic_persist_rollback\apps\foo'
+        $persistRoot = Join-Path $TestDrive 'atomic_persist_rollback\persist\foo'
+        $dataDir = Join-Path $persistRoot 'data'
+        New-Item -ItemType Directory -Path $dataDir -Force | Out-Null
+        $userFile = Join-Path $dataDir 'important.txt'
+        Set-Content -Path $userFile -Value 'precious-user-data'
+
+        $manifest = [PSCustomObject]@{
+            version      = '1.0'
+            persist      = 'data'
+            post_install = 'throw "post_install boom"'
+        }
+        Mock Get-Manifest { 'foo', $manifest, 'main', $null }
+        Mock Get-SupportedArchitecture { '64bit' }
+        Mock appdir { $appRoot }
+        Mock versiondir { Join-Path $appRoot $version }
+        Mock persistdir { $persistRoot }
+        Mock Invoke-ScoopDownload { 'foo.zip' }
+        Mock Invoke-Extraction { Set-Content -Path (Join-Path $Path 'foo.exe') -Value 'v1' }
+        Mock ensure_install_dir_not_in_path {}
+        Mock New-ShimFromManifest {}
+        Mock Remove-ShimFromManifest {}
+        Mock create_startmenu_shortcuts {}
+        Mock rm_startmenu_shortcuts {}
+        Mock install_psmodule {}
+        Mock uninstall_psmodule {}
+        Mock env_set {}
+        Mock env_rm {}
+        Mock env_add_path {}
+        Mock env_rm_path {}
+        Mock persist_permission {}
+        Mock error {}
+
+        $failed = @{}
+        install_app 'foo' '64bit' $false @{} $failed
+
+        $failed['foo'] | Should-Be 'post_install boom'
+        (Test-Path $userFile) | Should-BeTrue
+        (Get-Content $userFile -Raw).Trim() | Should-Be 'precious-user-data'
+        (Test-Path (Join-Path $appRoot '1.0')) | Should-BeFalse
+    }
+
+    It 'should restore backed-up version using its original manifest when same-version replacement fails' {
+        $appRoot = Join-Path $TestDrive 'atomic_same_ver\apps\foo'
+        $persistRoot = Join-Path $TestDrive 'atomic_same_ver\persist\foo'
+        $v1Dir = Join-Path $appRoot '1.0'
+        New-Item -ItemType Directory -Path $v1Dir -Force | Out-Null
+        Set-Content -Path (Join-Path $v1Dir 'foo.exe') -Value 'original-binary'
+
+        $oldManifest = [PSCustomObject]@{ version = '1.0'; env_add_path = @('old_bin') }
+        $newManifest = [PSCustomObject]@{ version = '1.0'; env_add_path = @('new_bin'); pre_install = 'throw "reinstall failed"' }
+
+        Mock Get-Manifest { 'foo', $newManifest, 'main', $null }
+        Mock Get-SupportedArchitecture { '64bit' }
+        Mock appdir { $appRoot }
+        Mock versiondir { Join-Path $appRoot $version }
+        Mock persistdir { $persistRoot }
+        Mock installed_manifest { $oldManifest }
+        Mock Select-CurrentVersion { '1.0' }
+        Mock Invoke-ScoopDownload { 'foo.zip' }
+        Mock Invoke-Extraction { Set-Content -Path (Join-Path $Path 'foo.exe') -Value 'new-binary' }
+        Mock link_current { $v1Dir }
+        Mock link_app {}
+        Mock error {}
+
+        $failed = @{}
+        install_app 'foo' '64bit' $false @{} $failed
+
+        $failed['foo'] | Should-Be 'reinstall failed'
+        (Test-Path (Join-Path $v1Dir 'foo.exe')) | Should-BeTrue
+        (Get-Content (Join-Path $v1Dir 'foo.exe') -Raw).Trim() | Should-Be 'original-binary'
+        (Test-Path (Join-Path $appRoot '_scoop_old_1.0')) | Should-BeFalse
+        Should-Invoke link_app -Times 1 -ParameterFilter { $manifest -eq $oldManifest }
     }
 }
 

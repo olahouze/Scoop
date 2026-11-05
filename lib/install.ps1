@@ -69,11 +69,25 @@ function install_app($app, $architecture, $global, $suggested, $failed, $use_cac
         }
     }
     Write-Output "Installing '$app' ($version) [$architecture]$(if ($bucket) { " from '$bucket' bucket" } elseif ($url -like (usermanifestsdir) + '\*') { ' from generated manifest' } else { " from '$url'" })"
+    $target_dir = versiondir $app $version $global
+    $app_dir = appdir $app $global
+    $staging_dir = Join-Path $app_dir "_scoop_staging_$version"
+    $backup_dir = Join-Path $app_dir "_scoop_old_$version"
+    $persist_dir = persistdir $app $global
+    $installed_successfully = $false
+    $target_promoted = $false
+    $has_backup = $false
+    $backup_manifest = $null
+    $was_current = $false
     $linked = $false
+
     try {
-        $dir = ensure (versiondir $app $version $global)
-        $original_dir = $dir # keep reference to real (not linked) directory
-        $persist_dir = persistdir $app $global
+        if (Test-Path $staging_dir) {
+            Remove-Item $staging_dir -Recurse -Force -ErrorAction Stop
+        }
+
+        $dir = ensure $staging_dir
+        $original_dir = $target_dir # keep reference to real (not linked) directory
 
         $fname = Invoke-ScoopDownload $app $version $manifest $bucket $architecture $dir $use_cache $check_hash
         if ($null -eq $fname) {
@@ -81,6 +95,27 @@ function install_app($app, $architecture, $global, $suggested, $failed, $use_cac
             return
         }
         Invoke-Extraction -Path $dir -Name $fname -Manifest $manifest -ProcessorArchitecture $architecture
+
+        if (Test-Path $target_dir) {
+            $backup_manifest = installed_manifest $app $version $global
+            $was_current = (Select-CurrentVersion -AppName $app -Global:$global) -eq $version
+            if ($backup_manifest) {
+                unlink_persist_data $backup_manifest $target_dir
+            } else {
+                unlink_persist_data $manifest $target_dir
+            }
+            if (Test-Path $backup_dir) {
+                Remove-Item $backup_dir -Recurse -Force -ErrorAction Stop
+            }
+            Rename-Item -Path $target_dir -NewName (Split-Path $backup_dir -Leaf) -Force -ErrorAction Stop
+            $has_backup = $true
+        }
+
+        Rename-Item -Path $staging_dir -NewName (Split-Path $target_dir -Leaf) -Force -ErrorAction Stop
+        $target_promoted = $true
+        $dir = $target_dir
+        $original_dir = $dir
+
         Invoke-HookScript -HookType 'pre_install' -Manifest $manifest -ProcessorArchitecture $architecture
 
         if (!(Invoke-Installer -Path $dir -Name $fname -Manifest $manifest -ProcessorArchitecture $architecture -AppName $app -Global:$global)) {
@@ -102,6 +137,7 @@ function install_app($app, $architecture, $global, $suggested, $failed, $use_cac
             $suggested[$app] = $manifest.suggest
         }
 
+        $installed_successfully = $true
         success "'$app' ($version) was installed successfully!"
         if ($app -eq (get_config SHIM)) { Update-ShimInstance }
 
@@ -109,16 +145,58 @@ function install_app($app, $architecture, $global, $suggested, $failed, $use_cac
     } catch {
         $failed[$app_key] = $_.Exception.Message
         error $_.Exception.Message
-        if ($linked) {
-            # the failed version may have added shims or settings of its own
+    } finally {
+        if (-not $installed_successfully) {
+            if ($linked) {
+                # the failed version may have added shims or settings of its own
+                try {
+                    unlink_app $app $manifest $original_dir $persist_dir $global $architecture
+                } catch {
+                    warn "Failed to clean up the failed installation: $($_.Exception.Message)"
+                }
+            }
             try {
-                unlink_app $app $manifest $original_dir $persist_dir $global $architecture
+                if (Test-Path $staging_dir) {
+                    Remove-Item $staging_dir -Recurse -Force -ErrorAction Stop
+                }
+                if ($target_promoted -and (Test-Path $target_dir)) {
+                    unlink_persist_data $manifest $target_dir
+                    $persist_still_linked = $false
+                    if ($manifest.persist) {
+                        foreach ($p in @($manifest.persist)) {
+                            $source, $null = persist_def $p
+                            $item = Get-Item "$target_dir\$source" -ErrorAction SilentlyContinue
+                            if ($item -and $item.LinkType) {
+                                $persist_still_linked = $true
+                                break
+                            }
+                        }
+                    }
+                    if (-not $persist_still_linked) {
+                        Remove-Item $target_dir -Recurse -Force -ErrorAction Stop
+                    } else {
+                        warn "Skipped removing '$target_dir' because persisted data links are still attached."
+                    }
+                }
+                if ($has_backup -and (Test-Path $backup_dir) -and !(Test-Path $target_dir)) {
+                    Rename-Item -Path $backup_dir -NewName (Split-Path $target_dir -Leaf) -Force -ErrorAction Stop
+                    if ($was_current) {
+                        $restore_manifest = if ($backup_manifest) { $backup_manifest } else { $manifest }
+                        $restored_dir = link_current $target_dir
+                        link_app $restore_manifest $restored_dir $target_dir $persist_dir $global $architecture
+                    }
+                }
+                if ((Test-Path $app_dir) -and -not (Get-ChildItem $app_dir -Force)) {
+                    Remove-Item $app_dir -Force -ErrorAction Stop
+                }
             } catch {
                 warn "Failed to clean up the failed installation: $($_.Exception.Message)"
             }
+        } elseif ($has_backup -and (Test-Path $backup_dir)) {
+            Remove-Item $backup_dir -Recurse -Force -ErrorAction SilentlyContinue
         }
-        return
     }
+    return
 }
 
 function Invoke-Installer {
