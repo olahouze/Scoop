@@ -53,6 +53,38 @@ function Invoke-ScoopDownload ($app, $version, $manifest, $bucket, $architecture
     return $urls.ForEach({ url_filename $_ })
 }
 
+function Link-OrCopyFile($Source, $Destination) {
+    $resolvedSource = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Source)
+    $resolvedDest = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Destination)
+    if (Test-Path -LiteralPath $resolvedDest -PathType Container) {
+        $resolvedDest = Join-Path $resolvedDest (Split-Path $resolvedSource -Leaf)
+    }
+    if (Test-Path -LiteralPath $resolvedDest -PathType Leaf) {
+        Remove-Item -LiteralPath $resolvedDest -Force
+    }
+
+    # Only hardlink archives that will be extracted and removed.
+    # Standalone executables, scripts, or payloads that remain in the app directory
+    # are copied so in-place mutations cannot corrupt the shared cache.
+    $archivePattern = '\.(zip|7z|tar|gz|tgz|bz2|tbz2|xz|txz|zst|lzma|cab|iso|msi)$'
+    $isArchive = ($resolvedSource -match $archivePattern) -and ($resolvedDest -match $archivePattern)
+
+    if ($isArchive) {
+        $sourceDrive = [System.IO.Path]::GetPathRoot($resolvedSource)
+        $destDrive = [System.IO.Path]::GetPathRoot($resolvedDest)
+
+        if ($sourceDrive -and ($sourceDrive -ieq $destDrive)) {
+            try {
+                $null = New-Item -ItemType HardLink -Path $resolvedDest -Target $resolvedSource -Force -ErrorAction Stop
+                return
+            } catch {
+                # Fallback to copy if hardlink is unsupported on volume
+            }
+        }
+    }
+    Copy-Item -LiteralPath $resolvedSource -Destination $resolvedDest -Force
+}
+
 ## [System.Net] downloader
 
 function Invoke-CachedDownload ($app, $version, $url, $to, $cookies = $null, $use_cache = $true) {
@@ -66,7 +98,7 @@ function Invoke-CachedDownload ($app, $version, $url, $to, $cookies = $null, $us
 
     if (!($null -eq $to)) {
         if ($use_cache) {
-            Copy-Item $cached $to
+            Link-OrCopyFile $cached $to
         } else {
             Move-Item $cached $to -Force
         }
